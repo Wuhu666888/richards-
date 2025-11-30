@@ -1,0 +1,427 @@
+using DifferentialEquations
+using Flux
+using DiffEqFlux
+using Interpolations
+using Optimization
+using OptimizationOptimisers
+using OptimizationPolyalgorithms
+using ForwardDiff
+using Statistics
+using LinearAlgebra
+using Printf
+using Plots
+using CSV
+using DataFrames
+using Dates
+using Measures
+
+# --- 0. 准备工作 ---
+const OUTPUT_DIR = "结果输出"
+if !isdir(OUTPUT_DIR); mkdir(OUTPUT_DIR); end
+const F = Float64
+
+# --- 1. 物理模型与辅助函数 ---
+function vgm_robust(h, p)
+    # p = [log_alpha, n_val, log_Ks, theta_s, theta_r]
+    α = exp(p[1])
+    n = p[2]
+    Ks = exp(p[3])
+    θs, θr = p[4], p[5]
+    
+    # 极小值保护
+    epsilon = 1e-7
+
+    # 处理非饱和与饱和
+    if h < -epsilon
+        m = 1.0 - 1.0/n
+        abs_h = abs(h)
+        denom = (1.0 + (α * abs_h)^n)
+        Se = denom^(-m)
+        theta = θr + (θs - θr) * Se
+        
+        num = (θs - θr) * m * n * α^n * (abs_h^(n-1))
+        C = num / (denom^(m+1))
+        
+        K_rel = sqrt(Se) * (1.0 - (1.0 - Se^(1/m))^m)^2
+        K = Ks * K_rel
+        return theta, max(C, 1e-6), max(K, 1e-9)
+    else
+        # 饱和状态
+        theta = θs
+        C = 1e-5 # 饱和时给一点点容水度防止除零
+        K = Ks 
+        return theta, C, K
+    end
+end
+
+get_Ep(t) = 2 * max(0.0, sin(2 * π * t / 365.0 * 20))
+
+# --- 2. 神经网络重构 ---
+nn_model = Flux.Chain(
+    Flux.Dense(1, 10, tanh),
+    Flux.Dense(10, 10, tanh),
+    Flux.Dense(10, 1, sigmoid)
+)
+nn_model = Flux.f64(nn_model)
+p_nn_init, re_nn = Flux.destructure(nn_model)
+p_nn_init[end] = 1 # 初始抑制蒸发
+
+# --- 3. ODE 系统定义 (修复水流阻断问题) ---
+struct RichardsParams
+    z_nodes::Vector{F}
+    rain_itp::AbstractInterpolation
+    obs_indices::Vector{Int}
+end
+
+function richards_ode_improved!(dhdt, h, p, t, consts::RichardsParams)
+    # 参数解包
+    n_val = 1.1 + 1.4 * sigmoid(p[2]) 
+    p_phys = [p[1], n_val, p[3], 0.45, 0.05]
+    
+    z = consts.z_nodes
+    dz = diff(z)
+    N = length(h)
+    
+    h_surf = h[1]
+    
+    # 1. 神经网络蒸发
+    # 稍微放宽输入范围，防止边界截断梯度
+    input_val = tanh(log10(max(1e-3, abs(h_surf)) + 1.0) / 4.0)
+    beta = re_nn(p[6:end])([input_val])[1]
+    
+    dry_limit = sigmoid((h_surf + 1000.0) / 200.0)
+    E_pot = get_Ep(t)
+    E_act = beta * E_pot * dry_limit
+    
+    # 2. 降雨入渗 (保留饱和阻尼，这是最重要的保护)
+    R_t = consts.rain_itp(t)
+    # 当表层积水 h > 0 时，平滑地减少入渗，模拟地表产流
+    saturation_damping = sigmoid(-(h_surf) / 10.0) 
+    R_effective = R_t * saturation_damping
+    
+    Q_top = R_effective - E_act
+
+    # 3. 物理属性
+    K = zeros(eltype(h), N)
+    C = zeros(eltype(h), N)
+    
+    for i in 1:N
+        # 放宽 h 的限制，允许瞬间的高压，相信求解器会拉回来
+        h_safe = max(-1e8, min(10000.0, h[i])) 
+        
+        # 使用 vgm_robust
+        theta, C_val, K_val = vgm_robust(h_safe, p_phys)
+        
+        C[i] = max(C_val, 1e-7)
+        K[i] = max(K_val, 1e-9)
+    end
+    
+    # 4. 通量计算
+    q = Vector{eltype(h)}(undef, N-1)
+    for i in 1:N-1
+        # 使用简单的算术平均，数值上更平滑
+        K_mid = (K[i] + K[i+1]) / 2.0
+        
+        d_h = h[i+1] - h[i]
+        grad_h = d_h / dz[i] # 移除这里的 tanh 限制，让梯度自然形成
+        
+        # 重力向下 (grad_h - 1.0)
+        q[i] = -K_mid * (grad_h - 1.0)
+    end
+    
+    # 5. 组装 dh/dt (保留 dhdt 的软限制，但阈值调大)
+    # 如果 C 很小，flux 很大，dhdt 会爆炸。这里限制一下是必要的。
+    limit_dhdt = 1e5 # 允许每步变化 100,000 cm (数值上的瞬间调整)
+
+    val_top = (Q_top - q[1]) / (0.5 * dz[1]) / C[1]
+    dhdt[1] = limit_dhdt * tanh(val_top / limit_dhdt)
+    
+    for i in 2:N-1
+        dz_cell = (dz[i-1] + dz[i]) / 2.0
+        val_mid = (q[i-1] - q[i]) / dz_cell / C[i]
+        dhdt[i] = limit_dhdt * tanh(val_mid / limit_dhdt)
+    end
+    
+    q_bot = K[N] # 自由排水
+    val_bot = (q[N-1] - q_bot) / (0.5 * dz[N-1]) / C[N]
+    dhdt[N] = limit_dhdt * tanh(val_bot / limit_dhdt)
+end
+
+# --- 4. 数据加载与处理 ---
+println("=== 4. 数据加载 ===")
+
+df = CSV.read("数据/SM_VMD_Cleaned.csv", DataFrame)
+
+# 降雨处理
+raw_rain_mm = df[:, 2]
+raw_rain_cm = Float64.(raw_rain_mm ./ 10.0)
+println("最大降雨量: $(maximum(raw_rain_cm)) cm") 
+
+N_total_steps = nrow(df)
+t_data = Float64.(0:(N_total_steps-1))
+rain_itp = LinearInterpolation(t_data, raw_rain_cm, extrapolation_bc=Flat())
+println("正在计算降雨关键时间点 (tstops)...")
+# 找出所有降雨量 > 0 的时刻，强制求解器在这些时刻停顿计算
+rain_indices = findall(x -> x > 0.0, raw_rain_cm)
+rain_times = t_data[rain_indices]
+# 将降雨时刻及其前后微小偏移加入，确保捕捉脉冲
+tstops_points = sort(unique(vcat(rain_times, rain_times .+ 0.1)))
+# 湿度处理
+raw_sm = Matrix(df[:, 3:7])' |> collect .|> Float64
+if mean(raw_sm) > 1.0
+    raw_sm .= raw_sm ./ 100.0
+end
+
+# 网格构建
+obs_depths = [5.0, 10.0, 20.0, 50.0, 100.0]
+# 关键修改：在地表(0-2cm)增加高密度网格 (0.1, 0.5, 1.0)
+# 这能极大缓解降雨时的数值冲击
+dense_surface = [0.0, 0.1, 0.5, 1.0, 1.5]
+coarse_deep = 2.0:2.0:105.0
+z_nodes = sort(unique([dense_surface; coarse_deep; obs_depths]))
+println("优化后的网格节点数: $(length(z_nodes))")
+
+
+obs_indices = [findfirst(x -> isapprox(x, d, atol=1e-5), z_nodes) for d in obs_depths]
+
+# --- 智能初始化 ---
+println("正在初始化剖面...")
+theta_obs_init = raw_sm[:, 1]
+itp_theta = LinearInterpolation(obs_depths, theta_obs_init, extrapolation_bc=Line())
+
+function inverse_vgm(theta, p)
+    α = exp(p[1])
+    n = p[2]
+    θs, θr = p[4], p[5]
+    m = 1.0 - 1.0/n
+    theta_safe = max(θr + 0.001, min(θs - 0.001, theta))
+    Se = (theta_safe - θr) / (θs - θr)
+    term = max(0.0, Se^(-1.0/m) - 1.0)
+    return -(term^(1.0/n)) / α
+end
+
+# 使用较合理的初始参数反推 h
+p_phys_guess = [-3.7, -1.5, 1.5, 0.45, 0.05] 
+n_init_val = 1.1 + 1.4 * sigmoid(p_phys_guess[2])
+p_calc_temp = [p_phys_guess[1], n_init_val, p_phys_guess[3], 0.45, 0.05]
+
+h_init = zeros(F, length(z_nodes))
+for i in 1:length(z_nodes)
+    h_init[i] = inverse_vgm(itp_theta(z_nodes[i]), p_calc_temp)
+end
+h_init = max.(h_init, -5000.0)
+
+# 最终初始参数
+p_phys_init = [-3.7, -1.5, 1.5, 0.45, 0.05]  
+p_all_init = [p_phys_init; p_nn_init]
+
+const_params = RichardsParams(z_nodes, rain_itp, obs_indices)
+prob = ODEProblem((du, u, p, t) -> richards_ode_improved!(du, u, p, t, const_params), 
+                  h_init, (t_data[1], t_data[end]), p_all_init)
+
+# --- 5. 训练流程 (单阶段训练版) ---
+
+function train_stage_real(steps_to_train, current_p, max_iters=40)
+    t_stop = t_data[steps_to_train]
+    
+    # 筛选当前时间窗口内的 tstops
+    current_tstops = filter(x -> x <= t_stop, tstops_points)
+    
+    # 稍微加密采样 (Stride 改小一点)
+    stride = 6
+    train_indices = 1:stride:steps_to_train
+    target_data = raw_sm[:, train_indices]
+    save_times = t_data[train_indices]
+    
+    println("\n=== 训练: T=0 ~ $t_stop (Adding tstops & Slope Loss) ===")
+
+    function loss_fn(p)
+    # 将 abstol 和 reltol 放宽到 1e-1
+    # 对于土壤湿度(0.1~0.4)来说，1e-1 的压力头误差是可以接受的
+        _sol = solve(prob, QNDF(autodiff=true), p=p, 
+                 tspan=(t_data[1], t_stop), 
+                 saveat=save_times,
+                 tstops=current_tstops,
+                 abstol=1e-1, reltol=1e-1,
+                 dtmin=1e-10, # 设置一个最小步长底线
+                 maxiters=200000)
+        
+        if _sol.retcode != :Success
+            # 如果失败，返回一个巨大的 Loss，但不要太大导致 NaN
+            println("Solver failed at t=$(_sol.t[end])")
+            return 1e5 
+        end
+        
+        loss_val = 0.0
+        n_val = 1.1 + 1.4 * sigmoid(p[2])
+        p_phy = [p[1], n_val, p[3], 0.45, 0.05]
+        
+        # 预分配模拟结果矩阵
+        sim_matrix = zeros(eltype(p), size(target_data))
+        
+        for (j, t_val) in enumerate(_sol.t)
+            for (k, grid_idx) in enumerate(obs_indices)
+                h_val = _sol[grid_idx, j]
+                # 限制 h 防止数值爆炸
+                h_safe = max(-1e6, min(100.0, h_val))
+                theta_val, _, _ = vgm_robust(h_safe, p_phy)
+                sim_matrix[k, j] = theta_val
+                
+                # 基础 MSE Loss
+                loss_val += abs2(theta_val - target_data[k, j]) * 10.0
+            end
+        end
+        
+        # [修改点 B] 加入斜率 Loss (捕捉降雨引起的突变)
+        if size(sim_matrix, 2) > 1
+            sim_diff = diff(sim_matrix, dims=2)
+            obs_diff = diff(target_data, dims=2)
+            # 放大对“变化趋势”的惩罚
+            loss_val += sum(abs2, sim_diff - obs_diff) * 50.0
+        end
+        
+        # 正则化
+        return loss_val + 1e-4 * sum(abs2, p[6:end])
+    end
+
+    callback = function (p, l)
+        @printf("Loss: %.5f\n", l)
+        return false
+    end
+
+    optf = Optimization.OptimizationFunction((x,p)->loss_fn(x), Optimization.AutoForwardDiff())
+    optprob = Optimization.OptimizationProblem(optf, current_p)
+    
+    # 使用 Adam 优化器
+    res = Optimization.solve(optprob, OptimizationOptimisers.Adam(0.05), maxiters=max_iters, callback=callback)
+    return res.u
+end
+
+
+# --- 执行训练 (仅保留最终阶段) ---
+
+println("开始单阶段训练...")
+
+# 直接进行决战阶段训练 (前 500 步或者 min(1000, N_total_steps))
+# 注意 1: 初始参数使用 p_all_init
+steps_train_final = min(500, N_total_steps)
+
+println(">>> 正在进行训练 (Steps: $steps_train_final)...")
+p_final = train_stage_real(steps_train_final, p_all_init, 100)
+
+println("训练完成！")
+
+# --- 6. 结果生成与绘图 (全量版) ---
+println("=== 6. 结果生成与评价 ===")
+
+# 定义 NSE 计算函数
+function calculate_nse(sim::Vector{Float64}, obs::Vector{Float64})
+    # 确保长度一致
+    n = min(length(sim), length(obs))
+    sim = sim[1:n]
+    obs = obs[1:n]
+    
+    mean_obs = mean(obs)
+    numerator = sum(abs2, sim .- obs)
+    denominator = sum(abs2, obs .- mean_obs)
+    
+    # 防止分母为0
+    if denominator < 1e-9
+        return -999.0
+    end
+    
+    return 1.0 - (numerator / denominator)
+end
+
+steps_to_plot = N_total_steps 
+println("正在运行最终模拟 (Steps: $steps_to_plot)...")
+
+# 必须保持与训练时一致的求解器 QNDF，以保证结果一致性
+sol_final = solve(prob, QNDF(autodiff=true), p=p_final, 
+                  tspan=(t_data[1], t_data[steps_to_plot]),
+                  saveat=t_data[1:steps_to_plot],
+                  tstops=tstops_points, 
+                  abstol=1e-2, reltol=1e-2,
+                  dtmin=1e-10,
+                  maxiters=10000000) 
+
+valid_steps = length(sol_final.t)
+t_plot = t_data[1:valid_steps]
+
+println("有效模拟长度: $valid_steps / $N_total_steps")
+
+n_val_final = 1.1 + 1.4 * sigmoid(p_final[2])
+p_phys_opt = [p_final[1], n_val_final, p_final[3], 0.45, 0.05]
+
+# ================================
+# 绘图 A: 全时段土壤湿度对比 + NSE 计算
+# ================================
+plt_sm = plot(layout=(5, 1), size=(1000, 1200), margin=5mm, link=:x)
+titles = ["5cm", "10cm", "20cm", "50cm", "100cm"]
+
+# 存储所有层的 NSE 以计算平均值
+all_nse = Float64[]
+
+println("\n=== 模型精度评价 (NSE) ===")
+println("------------------------------------------------")
+@printf("%-10s | %-10s\n", "Depth", "NSE Score")
+println("------------------------------------------------")
+
+for (k, grid_idx) in enumerate(obs_indices)
+    sim_theta_series = zeros(valid_steps)
+    obs_series = raw_sm[k, 1:valid_steps] # 获取对应的观测数据
+    
+    # 计算模拟的含水量
+    for j in 1:valid_steps
+        h_safe = max(-1e8, min(10000.0, sol_final[grid_idx, j]))
+        sim_theta_series[j], _, _ = vgm_robust(h_safe, p_phys_opt)
+    end
+    
+    # --- 计算 NSE ---
+    nse_val = calculate_nse(sim_theta_series, obs_series)
+    push!(all_nse, nse_val)
+    
+    # 打印到控制台
+    @printf("%-10s | %.4f\n", titles[k], nse_val)
+    
+    # --- 绘图 ---
+    plot!(plt_sm, t_plot, sim_theta_series, subplot=k, label="Sim", color=:blue, lw=1.5)
+    scatter!(plt_sm, t_plot, obs_series, subplot=k, label="Obs", color=:red, ms=1.5, markerstrokewidth=0)
+    
+    # 将 NSE 显示在标题中
+    title!(plt_sm, subplot=k, "Depth: $(titles[k]) | NSE: $(round(nse_val, digits=3))")
+    ylabel!(plt_sm, subplot=k, "SM")
+end
+println("------------------------------------------------")
+println("Average NSE: $(round(mean(all_nse), digits=4))")
+println("------------------------------------------------")
+
+xlabel!(plt_sm, "Time Steps")
+savefig(plt_sm, joinpath(OUTPUT_DIR, "Final_SM_FullData_NSE.png"))
+
+# ================================
+# 绘图 B: 全时段通量分析 (保持不变)
+# ================================
+rain_flux_plot = [rain_itp(t) for t in t_plot]
+h_surf = [sol_final[1, j] for j in 1:valid_steps]
+
+nn_input_plot = [tanh(log10(max(1e-3, abs(h)) + 1.0) / 4.0) for h in h_surf]
+nn_beta = [re_nn(p_final[6:end])([val])[1] for val in nn_input_plot]
+
+evap_flux_plot = zeros(valid_steps)
+for j in 1:valid_steps
+    E_pot = get_Ep(t_plot[j])
+    dry_limit = sigmoid((h_surf[j] + 1000.0) / 200.0)
+    evap_flux_plot[j] = nn_beta[j] * E_pot * dry_limit
+end
+
+plt_flux = plot(size=(1000, 400), margin=5mm)
+plot!(plt_flux, t_plot, rain_flux_plot, label="Rain (cm/step)", fill=true, alpha=0.3, color=:blue, lw=0)
+plot!(plt_flux, t_plot, evap_flux_plot, label="Est. Evap (cm/step)", color=:green, lw=1.5)
+title!(plt_flux, "Surface Fluxes (Full Dataset)")
+xlabel!(plt_flux, "Time Steps")
+ylabel!(plt_flux, "Flux (cm)")
+
+savefig(plt_flux, joinpath(OUTPUT_DIR, "Final_Flux_FullData.png"))
+
+println("全量数据结果及NSE评价已保存至: $OUTPUT_DIR")
